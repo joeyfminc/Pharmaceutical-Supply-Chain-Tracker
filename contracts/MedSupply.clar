@@ -5,6 +5,8 @@
 (define-constant ERR-INVALID-STATUS (err u104))
 (define-constant ERR-INVALID-TRANSFER (err u105))
 (define-constant ERR-ALREADY-CONSUMED (err u106))
+(define-constant ERR-TEMPERATURE-VIOLATION (err u107))
+(define-constant ERR-INVALID-TEMPERATURE (err u108))
 
 (define-constant ROLE-MANUFACTURER u1)
 (define-constant ROLE-DISTRIBUTOR u2)
@@ -19,6 +21,7 @@
 (define-constant STATUS-RECALLED u6)
 
 (define-data-var medicine-id-nonce uint u0)
+(define-data-var temperature-reading-nonce uint u0)
 
 (define-map medicines
   { medicine-id: uint }
@@ -32,7 +35,11 @@
     status: uint,
     location: (string-ascii 64),
     is-recalled: bool,
-    created-at: uint
+    created-at: uint,
+    requires-cold-chain: bool,
+    min-temp-celsius: int,
+    max-temp-celsius: int,
+    temp-compliant: bool
   }
 )
 
@@ -61,6 +68,18 @@
 
 (define-data-var event-id-nonce uint u0)
 
+(define-map temperature-readings
+  { reading-id: uint }
+  {
+    medicine-id: uint,
+    temperature-celsius: int,
+    recorder: principal,
+    location: (string-ascii 64),
+    timestamp: uint,
+    is-compliant: bool
+  }
+)
+
 (define-public (register-stakeholder (role uint) (name (string-ascii 64)))
   (begin
     (asserts! (and (>= role u1) (<= role u4)) ERR-NOT-AUTHORIZED)
@@ -82,13 +101,17 @@
   (batch-number (string-ascii 32))
   (manufacturing-date uint)
   (expiry-date uint)
-  (location (string-ascii 64)))
+  (location (string-ascii 64))
+  (requires-cold-chain bool)
+  (min-temp-celsius int)
+  (max-temp-celsius int))
   (let ((medicine-id (+ (var-get medicine-id-nonce) u1))
         (stakeholder (map-get? stakeholders { user: tx-sender })))
     (asserts! (is-some stakeholder) ERR-NOT-AUTHORIZED)
     (asserts! (is-eq (get role (unwrap-panic stakeholder)) ROLE-MANUFACTURER) ERR-NOT-AUTHORIZED)
     (asserts! (> expiry-date manufacturing-date) ERR-INVALID-MEDICINE)
     (asserts! (is-none (map-get? medicines { medicine-id: medicine-id })) ERR-MEDICINE-EXISTS)
+    (asserts! (or (not requires-cold-chain) (< min-temp-celsius max-temp-celsius)) ERR-INVALID-TEMPERATURE)
     
     (var-set medicine-id-nonce medicine-id)
     
@@ -104,7 +127,11 @@
         status: STATUS-MANUFACTURED,
         location: location,
         is-recalled: false,
-        created-at: stacks-block-height
+        created-at: stacks-block-height,
+        requires-cold-chain: requires-cold-chain,
+        min-temp-celsius: min-temp-celsius,
+        max-temp-celsius: max-temp-celsius,
+        temp-compliant: true
       }
     )
     
@@ -130,6 +157,7 @@
       (asserts! (not (get is-recalled med-data)) ERR-INVALID-TRANSFER)
       (asserts! (not (is-eq (get status med-data) STATUS-CONSUMED)) ERR-ALREADY-CONSUMED)
       (asserts! (is-valid-transfer current-role target-role) ERR-INVALID-TRANSFER)
+      (asserts! (or (not (get requires-cold-chain med-data)) (get temp-compliant med-data)) ERR-TEMPERATURE-VIOLATION)
       
       (let ((new-status (get-transfer-status current-role target-role)))
         (map-set medicines
@@ -214,6 +242,7 @@
       (asserts! (is-eq patient-role ROLE-PATIENT) ERR-NOT-AUTHORIZED)
       (asserts! (not (get is-recalled med-data)) ERR-INVALID-TRANSFER)
       (asserts! (> (get expiry-date med-data) stacks-block-height) ERR-INVALID-MEDICINE)
+      (asserts! (or (not (get requires-cold-chain med-data)) (get temp-compliant med-data)) ERR-TEMPERATURE-VIOLATION)
       
       (map-set medicines
         { medicine-id: medicine-id }
@@ -277,6 +306,50 @@
   )
 )
 
+(define-public (record-temperature (medicine-id uint) (temperature-celsius int) (location (string-ascii 64)))
+  (let ((medicine (map-get? medicines { medicine-id: medicine-id }))
+        (stakeholder (map-get? stakeholders { user: tx-sender }))
+        (reading-id (+ (var-get temperature-reading-nonce) u1)))
+    
+    (asserts! (is-some medicine) ERR-MEDICINE-NOT-FOUND)
+    (asserts! (is-some stakeholder) ERR-NOT-AUTHORIZED)
+    
+    (let ((med-data (unwrap-panic medicine)))
+      (asserts! (get requires-cold-chain med-data) ERR-INVALID-MEDICINE)
+      (asserts! (is-eq (get current-owner med-data) tx-sender) ERR-NOT-AUTHORIZED)
+      
+      (let ((is-temp-compliant (and 
+                                 (>= temperature-celsius (get min-temp-celsius med-data))
+                                 (<= temperature-celsius (get max-temp-celsius med-data))))
+            (updated-compliance (and (get temp-compliant med-data) is-temp-compliant)))
+        
+        (var-set temperature-reading-nonce reading-id)
+        
+        (map-set temperature-readings
+          { reading-id: reading-id }
+          {
+            medicine-id: medicine-id,
+            temperature-celsius: temperature-celsius,
+            recorder: tx-sender,
+            location: location,
+            timestamp: stacks-block-height,
+            is-compliant: is-temp-compliant
+          }
+        )
+        
+        (map-set medicines
+          { medicine-id: medicine-id }
+          (merge med-data {
+            temp-compliant: updated-compliance
+          })
+        )
+        
+        (ok reading-id)
+      )
+    )
+  )
+)
+
 (define-read-only (get-medicine (medicine-id uint))
   (map-get? medicines { medicine-id: medicine-id })
 )
@@ -320,7 +393,29 @@
       (not (get is-recalled medicine-data))
       (> (get expiry-date medicine-data) stacks-block-height)
       (not (is-eq (get status medicine-data) STATUS-CONSUMED))
+      (or (not (get requires-cold-chain medicine-data)) (get temp-compliant medicine-data))
     )
     false
+  )
+)
+
+(define-read-only (get-temperature-reading (reading-id uint))
+  (map-get? temperature-readings { reading-id: reading-id })
+)
+
+(define-read-only (get-temperature-reading-count)
+  (var-get temperature-reading-nonce)
+)
+
+(define-read-only (check-cold-chain-compliance (medicine-id uint))
+  (match (map-get? medicines { medicine-id: medicine-id })
+    medicine-data
+    (ok {
+      requires-cold-chain: (get requires-cold-chain medicine-data),
+      min-temp-celsius: (get min-temp-celsius medicine-data),
+      max-temp-celsius: (get max-temp-celsius medicine-data),
+      temp-compliant: (get temp-compliant medicine-data)
+    })
+    ERR-MEDICINE-NOT-FOUND
   )
 )
