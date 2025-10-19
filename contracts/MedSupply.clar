@@ -7,6 +7,9 @@
 (define-constant ERR-ALREADY-CONSUMED (err u106))
 (define-constant ERR-TEMPERATURE-VIOLATION (err u107))
 (define-constant ERR-INVALID-TEMPERATURE (err u108))
+(define-constant ERR-QA-CHECKPOINT-EXISTS (err u109))
+(define-constant ERR-QA-CHECKPOINT-NOT-FOUND (err u110))
+(define-constant ERR-INVALID-QA-DATA (err u111))
 
 (define-constant ROLE-MANUFACTURER u1)
 (define-constant ROLE-DISTRIBUTOR u2)
@@ -22,6 +25,7 @@
 
 (define-data-var medicine-id-nonce uint u0)
 (define-data-var temperature-reading-nonce uint u0)
+(define-data-var qa-checkpoint-nonce uint u0)
 
 (define-map medicines
   { medicine-id: uint }
@@ -74,6 +78,22 @@
     medicine-id: uint,
     temperature-celsius: int,
     recorder: principal,
+    location: (string-ascii 64),
+    timestamp: uint,
+    is-compliant: bool
+  }
+)
+
+(define-map qa-checkpoints
+  { checkpoint-id: uint }
+  {
+    medicine-id: uint,
+    batch-number: (string-ascii 32),
+    inspector: principal,
+    test-type: (string-ascii 32),
+    test-result: (string-ascii 16),
+    compliance-status: (string-ascii 16),
+    notes: (string-utf8 256),
     location: (string-ascii 64),
     timestamp: uint,
     is-compliant: bool
@@ -415,6 +435,116 @@
       min-temp-celsius: (get min-temp-celsius medicine-data),
       max-temp-celsius: (get max-temp-celsius medicine-data),
       temp-compliant: (get temp-compliant medicine-data)
+    })
+    ERR-MEDICINE-NOT-FOUND
+  )
+)
+
+;; Quality Assurance Checkpoint System
+;; Independent QA tracking for pharmaceutical batches
+
+(define-public (record-qa-checkpoint
+  (medicine-id uint)
+  (test-type (string-ascii 32))
+  (test-result (string-ascii 16))
+  (compliance-status (string-ascii 16))
+  (notes (string-utf8 256))
+  (location (string-ascii 64)))
+  (let ((medicine (map-get? medicines { medicine-id: medicine-id }))
+        (stakeholder (map-get? stakeholders { user: tx-sender }))
+        (checkpoint-id (+ (var-get qa-checkpoint-nonce) u1)))
+    
+    (asserts! (is-some medicine) ERR-MEDICINE-NOT-FOUND)
+    (asserts! (is-some stakeholder) ERR-NOT-AUTHORIZED)
+    (asserts! (> (len test-type) u0) ERR-INVALID-QA-DATA)
+    (asserts! (> (len test-result) u0) ERR-INVALID-QA-DATA)
+    (asserts! (> (len compliance-status) u0) ERR-INVALID-QA-DATA)
+    
+    (let ((med-data (unwrap-panic medicine))
+          (is-compliant (or (is-eq compliance-status "PASS")
+                           (is-eq compliance-status "COMPLIANT")
+                           (is-eq compliance-status "APPROVED"))))
+      
+      (var-set qa-checkpoint-nonce checkpoint-id)
+      
+      (map-set qa-checkpoints
+        { checkpoint-id: checkpoint-id }
+        {
+          medicine-id: medicine-id,
+          batch-number: (get batch-number med-data),
+          inspector: tx-sender,
+          test-type: test-type,
+          test-result: test-result,
+          compliance-status: compliance-status,
+          notes: notes,
+          location: location,
+          timestamp: stacks-block-height,
+          is-compliant: is-compliant
+        }
+      )
+      
+      (ok checkpoint-id)
+    )
+  )
+)
+
+(define-public (update-qa-checkpoint-notes
+  (checkpoint-id uint)
+  (new-notes (string-utf8 256)))
+  (let ((checkpoint (map-get? qa-checkpoints { checkpoint-id: checkpoint-id }))
+        (stakeholder (map-get? stakeholders { user: tx-sender })))
+    
+    (asserts! (is-some checkpoint) ERR-QA-CHECKPOINT-NOT-FOUND)
+    (asserts! (is-some stakeholder) ERR-NOT-AUTHORIZED)
+    
+    (let ((checkpoint-data (unwrap-panic checkpoint)))
+      (asserts! (is-eq (get inspector checkpoint-data) tx-sender) ERR-NOT-AUTHORIZED)
+      
+      (map-set qa-checkpoints
+        { checkpoint-id: checkpoint-id }
+        (merge checkpoint-data { notes: new-notes })
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+(define-read-only (get-qa-checkpoint (checkpoint-id uint))
+  (map-get? qa-checkpoints { checkpoint-id: checkpoint-id })
+)
+
+(define-read-only (get-qa-checkpoint-count)
+  (var-get qa-checkpoint-nonce)
+)
+
+(define-read-only (is-qa-checkpoint-compliant (checkpoint-id uint))
+  (match (map-get? qa-checkpoints { checkpoint-id: checkpoint-id })
+    checkpoint-data
+    (get is-compliant checkpoint-data)
+    false
+  )
+)
+
+(define-read-only (get-batch-qa-summary (batch-number (string-ascii 32)))
+  (let ((checkpoint-count (var-get qa-checkpoint-nonce)))
+    (ok {
+      batch-number: batch-number,
+      total-checkpoints: checkpoint-count,
+      last-updated: stacks-block-height
+    })
+  )
+)
+
+(define-read-only (verify-qa-compliance (medicine-id uint))
+  (match (map-get? medicines { medicine-id: medicine-id })
+    medicine-data
+    (ok {
+      medicine-id: medicine-id,
+      batch-number: (get batch-number medicine-data),
+      manufacturer: (get manufacturer medicine-data),
+      qa-checkpoints-available: true,
+      verified-at: stacks-block-height
     })
     ERR-MEDICINE-NOT-FOUND
   )
