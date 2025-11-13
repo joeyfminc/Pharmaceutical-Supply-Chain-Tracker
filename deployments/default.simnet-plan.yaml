@@ -66,6 +66,6 @@ plan:
         - emulated-contract-publish:
             contract-name: MedSupply
             emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
-            path: contracts/MedSupply.clar
+            path: "contracts\\MedSupply.clar"
             clarity-version: 3
       epoch: "3.2"

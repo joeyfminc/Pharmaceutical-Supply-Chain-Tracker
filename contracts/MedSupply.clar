@@ -10,6 +10,10 @@
 (define-constant ERR-QA-CHECKPOINT-EXISTS (err u109))
 (define-constant ERR-QA-CHECKPOINT-NOT-FOUND (err u110))
 (define-constant ERR-INVALID-QA-DATA (err u111))
+(define-constant ERR-BATCH-NOT-FOUND (err u112))
+(define-constant ERR-BATCH-RETIRED (err u113))
+(define-constant ERR-INVALID-BATCH-DATA (err u114))
+(define-constant ERR-BATCH-LIFECYCLE-UPDATE-FAILED (err u115))
 
 (define-constant ROLE-MANUFACTURER u1)
 (define-constant ROLE-DISTRIBUTOR u2)
@@ -22,6 +26,11 @@
 (define-constant STATUS-DISPENSED u4)
 (define-constant STATUS-CONSUMED u5)
 (define-constant STATUS-RECALLED u6)
+
+(define-constant STAGE-FRESH u1)
+(define-constant STAGE-AGING u2)
+(define-constant STAGE-CRITICAL u3)
+(define-constant STAGE-EXPIRED u4)
 
 (define-data-var medicine-id-nonce uint u0)
 (define-data-var temperature-reading-nonce uint u0)
@@ -100,6 +109,20 @@
   }
 )
 
+(define-map batch-lifecycle
+  { batch-number: (string-ascii 32) }
+  {
+    medicine-id: uint,
+    lifecycle-stage: uint,
+    created-at: uint,
+    expiry-date: uint,
+    total-units: uint,
+    units-remaining: uint,
+    last-stage-update: uint,
+    is-retired: bool
+  }
+)
+
 (define-public (register-stakeholder (role uint) (name (string-ascii 64)))
   (begin
     (asserts! (and (>= role u1) (<= role u4)) ERR-NOT-AUTHORIZED)
@@ -171,13 +194,20 @@
     
     (let ((med-data (unwrap-panic medicine))
           (current-role (get role (unwrap-panic current-stakeholder)))
-          (target-role (get role (unwrap-panic target-stakeholder))))
+          (target-role (get role (unwrap-panic target-stakeholder)))
+          (batch-number (get batch-number med-data)))
       
       (asserts! (is-eq (get current-owner med-data) tx-sender) ERR-NOT-AUTHORIZED)
       (asserts! (not (get is-recalled med-data)) ERR-INVALID-TRANSFER)
       (asserts! (not (is-eq (get status med-data) STATUS-CONSUMED)) ERR-ALREADY-CONSUMED)
       (asserts! (is-valid-transfer current-role target-role) ERR-INVALID-TRANSFER)
       (asserts! (or (not (get requires-cold-chain med-data)) (get temp-compliant med-data)) ERR-TEMPERATURE-VIOLATION)
+      
+      (match (map-get? batch-lifecycle { batch-number: batch-number })
+        batch-data
+          (asserts! (not (get is-retired batch-data)) ERR-BATCH-RETIRED)
+        true
+      )
       
       (let ((new-status (get-transfer-status current-role target-role)))
         (map-set medicines
@@ -236,6 +266,17 @@
           status: STATUS-RECALLED,
           is-recalled: true
         })
+      )
+      
+      (let ((batch-number (get batch-number med-data)))
+        (match (map-get? batch-lifecycle { batch-number: batch-number })
+          batch-data
+            (map-set batch-lifecycle
+              { batch-number: batch-number }
+              (merge batch-data { is-retired: true })
+            )
+          true
+        )
       )
       
       (unwrap-panic (log-supply-chain-event medicine-id tx-sender tx-sender STATUS-RECALLED (get location med-data) reason))
@@ -547,5 +588,134 @@
       verified-at: stacks-block-height
     })
     ERR-MEDICINE-NOT-FOUND
+  )
+)
+
+(define-public (register-batch (batch-number (string-ascii 32)) (medicine-id uint) (total-units uint))
+  (let ((current-height stacks-block-height))
+    (map-set batch-lifecycle
+      { batch-number: batch-number }
+      {
+        medicine-id: medicine-id,
+        lifecycle-stage: STAGE-FRESH,
+        created-at: current-height,
+        expiry-date: (+ current-height u52560),
+        total-units: total-units,
+        units-remaining: total-units,
+        last-stage-update: current-height,
+        is-retired: false
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (retire-batch (batch-number (string-ascii 32)))
+  (match (map-get? batch-lifecycle { batch-number: batch-number })
+    batch-data
+      (begin
+        (map-set batch-lifecycle
+          { batch-number: batch-number }
+          (merge batch-data { is-retired: true })
+        )
+        (ok true)
+      )
+    ERR-BATCH-NOT-FOUND
+  )
+)
+
+(define-public (update-batch-unit-count (batch-number (string-ascii 32)) (units-consumed uint))
+  (match (map-get? batch-lifecycle { batch-number: batch-number })
+    batch-data
+      (if (<= units-consumed (get units-remaining batch-data))
+        (begin
+          (map-set batch-lifecycle
+            { batch-number: batch-number }
+            (merge batch-data { units-remaining: (- (get units-remaining batch-data) units-consumed) })
+          )
+          (ok true)
+        )
+        ERR-INVALID-BATCH-DATA
+      )
+    ERR-BATCH-NOT-FOUND
+  )
+)
+
+(define-public (check-batch-lifecycle-stage (batch-number (string-ascii 32)) (current-block-height uint))
+  (match (map-get? batch-lifecycle { batch-number: batch-number })
+    batch-data
+      (let (
+        (expiry-date (get expiry-date batch-data))
+        (created-at (get created-at batch-data))
+        (total-shelf-life (- expiry-date created-at))
+        (blocks-remaining (if (> expiry-date current-block-height) (- expiry-date current-block-height) u0))
+        (new-stage (if (is-eq blocks-remaining u0)
+                     STAGE-EXPIRED
+                     (if (> blocks-remaining (/ (* total-shelf-life u66) u100))
+                       STAGE-FRESH
+                       (if (> blocks-remaining (/ (* total-shelf-life u33) u100))
+                         STAGE-AGING
+                         STAGE-CRITICAL))))
+      )
+        (begin
+          (map-set batch-lifecycle
+            { batch-number: batch-number }
+            (merge batch-data {
+              lifecycle-stage: new-stage,
+              last-stage-update: current-block-height
+            })
+          )
+          (ok new-stage)
+        )
+      )
+    ERR-BATCH-NOT-FOUND
+  )
+)
+
+(define-read-only (get-batch-lifecycle (batch-number (string-ascii 32)))
+  (map-get? batch-lifecycle { batch-number: batch-number })
+)
+
+(define-read-only (get-batch-expiry-status (batch-number (string-ascii 32)))
+  (match (map-get? batch-lifecycle { batch-number: batch-number })
+    batch-data
+      (ok {
+        lifecycle-stage: (get lifecycle-stage batch-data),
+        days-remaining: (/ (if (> (get expiry-date batch-data) stacks-block-height)
+                              (- (get expiry-date batch-data) stacks-block-height)
+                              u0) u144),
+        is-retired: (get is-retired batch-data)
+      })
+    ERR-BATCH-NOT-FOUND
+  )
+)
+
+(define-read-only (calculate-batch-age (batch-number (string-ascii 32)) (current-height uint))
+  (match (map-get? batch-lifecycle { batch-number: batch-number })
+    batch-data
+      (ok (if (> (get expiry-date batch-data) current-height)
+        (- (get expiry-date batch-data) current-height)
+        u0))
+    ERR-BATCH-NOT-FOUND
+  )
+)
+
+(define-read-only (is-batch-expired (batch-number (string-ascii 32)) (current-height uint))
+  (match (map-get? batch-lifecycle { batch-number: batch-number })
+    batch-data
+      (ok (>= current-height (get expiry-date batch-data)))
+    ERR-BATCH-NOT-FOUND
+  )
+)
+
+(define-read-only (get-batch-safety-score (batch-number (string-ascii 32)))
+  (match (map-get? batch-lifecycle { batch-number: batch-number })
+    batch-data
+      (let ((stage (get lifecycle-stage batch-data)))
+        (ok (if (is-eq stage STAGE-FRESH) u100
+          (if (is-eq stage STAGE-AGING) u66
+            (if (is-eq stage STAGE-CRITICAL) u33
+              u0)))))
+    ERR-BATCH-NOT-FOUND
   )
 )
